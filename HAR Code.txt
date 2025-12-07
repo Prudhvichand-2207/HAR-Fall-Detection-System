@@ -1,0 +1,949 @@
+from google.colab import drive
+drive.mount("/content/gdrive")
+
+!gdown -q 1-E-TLd5_J-DDWZXkuYL-moMpoezlMn4Z
+
+!gdown -q 1gvOuxPc8dNgTnxuvPcVuCKifOf98-TV0
+
+!unzip SisFall_enhanced.zip -d CONTENT
+
+!unzip SisFall_dataset.zip -d data
+
+!zip -r /content/gdrive.zip /content/gdrive/
+
+from google.colab import files
+files.download("/content/gdrive.zip")
+
+
+
+### Imports and installation
+
+!pip install -q tqdm
+
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve, roc_auc_score, roc_curve
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.utils import compute_class_weight
+from itertools import groupby, chain
+import matplotlib.pyplot as plt
+from tensorflow import keras
+import tensorflow as tf
+from tqdm import tqdm
+from math import sqrt
+import seaborn as sn
+import pandas as pd
+import numpy as np
+import random
+import pickle
+import glob
+import os
+sn.set()
+
+
+window_size = 200
+
+### Additional Functions
+
+colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+def plot_confusion_matrix(confusion_matrix, title='', cmap ='Greens'):
+    df = pd.DataFrame(confusion_matrix, ['not fall', 'fall'], ['not fall', 'fall'])
+    plt.figure(figsize=(7,4))
+    if title == '' :
+        plt.title('Confusion Matrix')
+    else:
+        plt.title('Confusion Matrix for' + ' ' + title)
+    sn.set(font_scale=1) # for label size
+    sn.heatmap(df, annot=True, annot_kws={"size": 12},fmt='.0f',cmap=cmap) # font size
+    plt.ylabel('Actual label')
+    plt.xlabel('Predicted label')
+    plt.show()
+
+
+def plot_precision_recall_curve(actual_labels, prediction, title='', model_name='', file_name=None):
+    precision, recall, thresholds=precision_recall_curve(actual_labels, prediction)
+    plt.figure(figsize=(8,6))
+    fig, ax = plt.subplots()
+    ax.plot(recall, precision, label='Model: {model_name}'.format(model_name=model_name), color='purple')
+
+    # add axis labels to plot
+    if title == '':
+        plt.title(title)
+    else:
+        plt.title('Precision-Recall Curve')
+    ax.set_ylabel('Precision')
+    ax.set_xlabel('Recall')
+
+    # display plot
+    plt.show()
+    if file_name is not None:
+        plt.savefig(file_name)
+
+def plot_roc_curve(actual_labels, prediction, title='', model_name='', file_name=None):
+    fpr, tpr, _ = roc_curve(actual_labels, prediction)
+    plt.figure(figsize=(8,6))
+    plt.plot(fpr, tpr, label='Model: {model_name}'.format(model_name=model_name), color='blue')
+    if title == '':
+        plt.title(title)
+    else:
+        plt.title('ROC Learning Curves')
+    plt.xlabel('false positive rate')
+    plt.ylabel('true positive rate')
+    plt.show()
+
+    if file_name is not None:
+        plt.savefig(file_name)
+
+def plot_metrics(history):
+    metrics = ['loss', 'PRC', 'Precision', 'Recall']
+    plt.figure(figsize=(10,10),linewidth = 7, edgecolor="whitesmoke")
+
+    for n, metric in enumerate(metrics):
+        name = metric.replace("_"," ").capitalize()
+        plt.subplot(2,2,n+1)
+        plt.plot(history.epoch, history.history[metric], color=colors[0], label='Train')
+        plt.plot(history.epoch, history.history['val_'+metric],
+             color=colors[0], linestyle="--", label='Val')
+        plt.xlabel('Epoch')
+        plt.ylabel(name)
+    if metric == 'loss':
+        plt.ylim([0, plt.ylim()[1]])
+    elif metric == 'auc':
+        plt.ylim([0.8,1])
+    else:
+        plt.ylim([0,1])
+
+    plt.legend()
+
+def plot_auc_curve(actual_labels, prediction, title='', model_name='', file_name = None):
+    fpr, tpr, _ = roc_curve(actual_labels,  prediction)
+    auc = roc_auc_score(actual_labels, prediction).round(4)
+    plt.figure(figsize=(8,6))
+    if title == '':
+        plt.title(title)
+    else:
+        plt.title('AUC Learning Curves')
+    plt.plot(fpr,tpr, label='Model: '+ model_name + ", AUC=" + str(auc), color='red')
+    plt.legend(loc=4)
+    plt.show()
+    if file_name is not None:
+        plt.savefig(file_name)
+
+def plot_history(history):
+
+    plt.figure(figsize=(10,5),linewidth = 7, edgecolor="whitesmoke")
+    n = len(history.history['Accuracy'])
+
+    plt.plot(np.arange(0,n)+1,history.history['Accuracy'], color='orange',marker=".")
+    plt.plot(np.arange(0,n)+1,history.history['loss'],'b',marker=".")
+
+    # offset both validation curves
+    plt.plot(np.arange(0,n)+ 1,history.history['val_Accuracy'],'r')
+    plt.plot(np.arange(0,n)+ 1,history.history['val_loss'],'g')
+
+    plt.legend(['Train Acc','Train Loss','Val Acc','Val Loss'])
+    plt.grid(True)
+
+    # set vertical limit to 1
+    plt.gca().set_ylim(0,1)
+
+    plt.xlabel("Number of Epochs")
+    plt.ylabel("Value")
+    plt.suptitle("Learning Curve", size=16, y=0.927)
+    plt.show()
+
+def save_pickle(variable, path):
+  with open(path,'wb') as f:
+    pickle.dump(variable, f)
+    return
+
+def load_pickle(path):
+  with open(path,'rb') as f:
+    return pickle.load(f)
+
+## Pre-Processor
+
+class DatasetProcessor():
+
+  def get_file_name(self, path, ratio=0.8):
+    allfiles = []
+    allFolders = sorted(glob.glob(path + "*"))
+    for files in allFolders:
+      allfiles.append(sorted(glob.glob(files+"/*.txt")))
+    if 'desktop.ini' in allfiles:
+          allfiles.remove('desktop.ini')
+    if not allfiles: # Check if allfiles is empty and raise an error if so
+        raise ValueError("No .txt files found in the specified directory.")
+
+    dataset = np.hstack(allfiles)
+    start = dataset[0].rfind('/') + 1
+    end = dataset[0][start:].find('_') + start
+    dataset = [list(g) for k, g in groupby(dataset, key=lambda x: x[start:end])]
+    train = []
+    test = []
+    for data in dataset:
+      if len(data) == 1:
+        if random.randint(1,100)>=81:
+          test.extend(data)
+        else:
+          train.extend(data)
+
+      else:
+        random.shuffle(data)
+        train.extend(data[:int(len(data)*ratio)])
+        test.extend(data[int(len(data)*ratio):])
+
+    return train, test
+
+  def __read_data(self, data_path):
+    data = pd.read_csv(data_path, header=None)
+    data.columns = ['ADXL345_x', 'ADXL345_y', 'ADXL345_z', 'ITG3200_x', 'ITG3200_y', 'ITG3200_z', 'MMA8451Q_x',
+                    'MMA8451Q_y', 'MMA8451Q_z']
+    data['MMA8451Q_z'] = data['MMA8451Q_z'].map(lambda x: str(x)[:-1])
+    for name in data.columns :
+      data[name] = data[name].astype(float)
+    return data
+
+  def __add_label(self, data_path, merge_feature=False):
+
+    dataset = self.__read_data(data_path)
+
+    if not merge_feature:
+      dataset['label'] = self.__get_label(data_path)
+      return dataset.to_numpy()
+
+    else:
+      new_dataset = pd.DataFrame()
+      new_dataset['acc_1'] = dataset.apply(
+          lambda row: sqrt((row.ADXL345_x ** 2 + row.ADXL345_y ** 2 + row.ADXL345_z ** 2)), axis=1)
+      new_dataset['acc_2'] = dataset.apply(
+          lambda row: sqrt((row.MMA8451Q_x ** 2 + row.MMA8451Q_y ** 2 + row.MMA8451Q_z ** 2)), axis=1)
+      new_dataset['geo'] = dataset.apply(
+          lambda row: sqrt((row.ITG3200_x ** 2 + row.ITG3200_y ** 2 + row.ITG3200_z ** 2)), axis=1)
+      new_dataset['label'] = self.__get_label(data_path)
+
+      return np.round(new_dataset.to_numpy(), 2)
+
+  def __get_label(self, data_path):
+    label = data_path[54]
+    if label =='D':
+      return int(0)
+    elif label =='F':
+      print(data_path)
+      label_path = data_path.replace('dataset', 'enhanced')
+      labels = pd.read_csv(label_path, header=None)
+      return labels
+
+  def datasets_to_nparray(self, datasets_address_array, outputsize=20000000, column_dimension=10):
+    result = np.zeros((outputsize, column_dimension), 'int16')
+    first_index = 0
+    for address in tqdm(datasets_address_array, ncols=50):
+      feature = self.__add_label(address)
+      result[first_index : (first_index+len(feature))] = feature
+      first_index += len(feature)
+
+    return result[result.sum(axis=1) != 0]
+
+  def windowing2d(self, dataset, window_size=200):
+    window = window_size * (dataset.shape[1]-1)
+    cut = dataset.shape[0] % window_size
+    feature = dataset[:-cut,0:-1]
+    label = dataset[:-cut,-1]
+    feature = feature.ravel().reshape(feature.size//window,window)
+    label = label.reshape(label.size// window_size, window_size)
+    label = label.sum(axis=1)
+    label[label > 0] = 1
+    feature = np.roll((np.roll(feature, -1, axis=0) - feature), 1, axis=0)
+    feature[0] = 0
+    return feature, label.ravel()
+
+  def windowing3d(self, dataset, window_size=200):
+    n_windows = len(dataset) // window_size
+    cut = dataset.shape[0] % window_size
+    feature = dataset[:-cut,0:-1]
+    label = dataset[:-cut,-1]
+    feature = feature.reshape(n_windows, window_size, dataset.shape[1]-1)
+    label = label.reshape(n_windows, window_size, 1)
+    label = label.sum(axis=1)
+    label[label > 0] = 1
+    feature = np.roll((np.roll(feature, -1, axis=0) - feature), 1, axis=0)
+    feature[0] = 0
+    return feature, label.ravel()
+
+  def normalizer(self, scaler, X_train, X_test):
+    X_train = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
+    X_test = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
+    return X_train, X_test
+
+  def dataset_to_tensor(self, window_size, dataset, saving_path):
+    features, labels = self.windowing(self.__datasets_to_nparray(dataset), window_size)
+    return features, labels
+
+  def downsampling(self, dataset, down_sampleing_factor):
+      positive = dataset[dataset['targets']==1]
+      negative = dataset[dataset['targets']==0].sample(n=int(len(positive)* down_sampleing_factor))
+      return pd.concat([positive, negative], ignore_index=True).sample(frac=1).reset_index(drop=True)
+
+  def generate_class_weight(self, label):
+    class_weights = compute_class_weight(class_weight = "balanced",
+                                         classes = np.unique(label),
+                                         y = label)
+    return dict(zip(np.unique(label), class_weights))
+
+
+%%time
+
+dp = DatasetProcessor()
+print('1.Split Adresses...')
+
+train, test = dp.get_file_name('/content/gdrive/MyDrive/Datasets/SisFall_dataset/')
+
+print('2.Extract Features and Labels...')
+print('------------------------Train Dataset')
+train_dataset = dp.datasets_to_nparray(train)
+print('------------------------Test Dataset')
+test_dataset = dp.datasets_to_nparray(test)
+
+print('3.Windowing...')
+print('------------------------Train Dataset')
+X_train, y_train = dp.windowing3d(train_dataset)
+print('------------------------Test Dataset')
+X_test, y_test = dp.windowing3d(test_dataset)
+
+print('4.Normalizing...')
+scaler = StandardScaler()
+X_train, X_test = dp.normalizer(scaler, X_train, X_test)
+
+print('5.Calculate Class Weight...')
+class_weight = dp.generate_class_weight(y_train)
+
+
+### Save/Load train & test dataset
+
+import os
+
+save = False
+if save:
+  # Create the directory if it doesn't exist
+  os.makedirs('/content/gdrive/MyDrive/Fall Detection System/Dataset/', exist_ok=True)
+
+  save_pickle(X_train, '/content/gdrive/MyDrive/Fall Detection System/Dataset/X_train.pkl') # Added X_train as the first argument
+  save_pickle(y_train, '/content/gdrive/MyDrive/Fall Detection System/Dataset/y_train.pkl') # Added y_train as the first argument
+  save_pickle(X_test, '/content/gdrive/MyDrive/Fall Detection System/Dataset/X_test.pkl') # Added X_test as the first argument
+  save_pickle(y_test, '/content/gdrive/MyDrive/Fall Detection System/Dataset/y_test.pkl') # Added y_test as the first argument
+else:
+  X_train = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Dataset/X_train.pkl')
+  y_train = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Dataset/y_train.pkl')
+  X_test = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Dataset/X_test.pkl')
+  y_test = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Dataset/y_test.pkl')
+  dp = DatasetProcessor()
+  class_weight = dp.generate_class_weight(y_train)
+
+print(f'X_train shape: {X_train.shape}')
+print(f'y_train shape: {y_train.shape}')
+print(f'X_test shape: {X_test.shape}')
+print(f'y_test shape: {y_test.shape}')
+
+import tensorflow as tf
+from tensorflow import keras
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+import numpy as np
+
+class TrainEvaluateDeep:
+    def build_cnn(self, input_size, units=128, drop_rate=0.25, filter=32, kernel_size=9, output_size=1):
+        input = keras.layers.Input(shape=input_size)
+        x = keras.layers.Conv1D(filters=filter//2, kernel_size=kernel_size, padding='same', activation='relu', name="conv1")(input)
+        x = keras.layers.Conv1D(filters=filter, kernel_size=kernel_size, padding='same', activation='relu', name="conv2")(x)
+        x = keras.layers.Conv1D(filters=filter*2, kernel_size=kernel_size, padding='same', activation='relu', name="conv3")(x)
+        x = keras.layers.Flatten()(x)
+        classifier = keras.layers.Dense(units*4, activation='relu')(x)
+        classifier = keras.layers.Dropout(drop_rate)(classifier)
+        classifier = keras.layers.Dense(units, activation='relu')(classifier)
+        classifier = keras.layers.Dropout(drop_rate)(classifier)
+        classifier = keras.layers.Dense(units//2, activation='relu')(classifier)
+        classifier = keras.layers.Dropout(drop_rate)(classifier)
+        output = keras.layers.Dense(output_size, activation='sigmoid')(classifier)
+        model = keras.Model(inputs=input, outputs=output)
+        return model
+
+    def train_deep_model(self, model, X_train, y_train, optimizer, loss_function, callbacks, metrics, class_weight, epochs):
+        model.compile(optimizer=optimizer,
+                      loss=loss_function,
+                      metrics=metrics)
+        history = model.fit(X_train, y_train,
+                            validation_split=0.2,
+                            epochs=epochs,
+                            batch_size=128,
+                            class_weight=class_weight,
+                            callbacks=callbacks,
+                            verbose=1)
+        return history
+
+    def evaluate(self, model, X_test, y_test, batch_size=128, threshold=0.5, title='Model', model_name='Model', plot=False):
+        y_prob = model.predict(X_test, batch_size=batch_size)
+        y_pred = (y_prob > threshold).astype(int)
+        print(f"{title} Classification Report:")
+        print(classification_report(y_test, y_pred))
+        print("Accuracy:", accuracy_score(y_test, y_pred))
+        print("Confusion Matrix:")
+        print(confusion_matrix(y_test, y_pred))
+        return y_pred
+
+    def plot_learning_curves(self, history):
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['loss'], label='Train Loss')
+        plt.plot(history.history['val_loss'], label='Val Loss')
+        plt.legend()
+        plt.title('Loss over epochs')
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['accuracy'], label='Train Acc')
+        plt.plot(history.history['val_accuracy'], label='Val Acc')
+        plt.legend()
+        plt.title('Accuracy over epochs')
+        plt.show()
+
+
+
+# Assume X_train, y_train, X_test, y_test, class_weight are already available from preprocessing
+train_evaluate_deep = TrainEvaluateDeep()
+
+print('1. Build Model...')
+cnn_model = train_evaluate_deep.build_cnn(input_size=X_train.shape[1:])
+
+print('2. Train Model...')
+from tensorflow.keras.callbacks import EarlyStopping
+
+def get_early_stopping(metric='val_accuracy', patience=10, mode='max'):
+    return EarlyStopping(monitor=metric, patience=patience, mode=mode, restore_best_weights=True)
+
+classification_metrics = ['accuracy']
+
+cnn_history = train_evaluate_deep.train_deep_model(cnn_model,
+                                                   X_train,
+                                                   y_train,
+                                                   optimizer=tf.optimizers.SGD(learning_rate=0.001),
+                                                   loss_function=keras.losses.BinaryCrossentropy(),
+                                                   callbacks=[get_early_stopping(metric='val_accuracy', patience=10, mode='max')],
+                                                   metrics=classification_metrics,
+                                                   class_weight=class_weight,
+                                                   epochs=30)
+
+print('3. Evaluation...')
+prediction = train_evaluate_deep.evaluate(cnn_model, X_test, y_test, batch_size=128, threshold=0.9, title='CNN + MLP', model_name='CNN + MLP', plot=False)
+
+plot_learning_curves = False
+if plot_learning_curves:
+    print('4. Plot learning curves...')
+    _ = train_evaluate_deep.plot_learning_curves(cnn_history)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping
+
+class TrainEvaluateDeep:
+    def build_pcnn_transformer(self, input_size, num_classes=1, num_heads=4, ff_dim=128, drop_rate=0.3):
+        inputs = keras.Input(shape=input_size)
+
+        # Initial Conv1D
+        x = layers.Conv1D(64, kernel_size=3, padding='same')(inputs)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.MaxPooling1D(pool_size=2)(x)
+
+        def parallel_conv_block(x):
+            conv1 = layers.Conv1D(64, kernel_size=3, padding='same')(x)
+            conv1 = layers.BatchNormalization()(conv1)
+            conv1 = layers.ReLU()(conv1)
+            conv2 = layers.Conv1D(64, kernel_size=3, padding='same')(conv1)
+            conv2 = layers.BatchNormalization()(conv2)
+            out = layers.Add()([x, conv2])
+            out = layers.ReLU()(out)
+            return out
+
+        # 3 Parallel Conv1D Blocks
+        conv1 = parallel_conv_block(x)
+        conv2 = parallel_conv_block(x)
+        conv3 = parallel_conv_block(x)
+
+        # Max pooling each
+        conv1 = layers.MaxPooling1D(pool_size=2)(conv1)
+        conv2 = layers.MaxPooling1D(pool_size=2)(conv2)
+        conv3 = layers.MaxPooling1D(pool_size=2)(conv3)
+
+        # Transformer Encoder Block
+        def transformer_encoder(inputs, head_size, ff_dim, dropout=0):
+            x = layers.LayerNormalization(epsilon=1e-6)(inputs)
+            x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(x, x)
+            x = layers.Add()([x, inputs])
+
+            res = x
+            x = layers.LayerNormalization(epsilon=1e-6)(x)
+            x = layers.Dense(ff_dim, activation="relu")(x)
+            x = layers.Dense(inputs.shape[-1])(x)
+            x = layers.Add()([x, res])
+            return x
+
+        transformer = transformer_encoder(x, head_size=64, ff_dim=ff_dim, dropout=drop_rate)
+        transformer = layers.GlobalAveragePooling1D()(transformer)
+
+        # Flatten all
+        conv1 = layers.Flatten()(conv1)
+        conv2 = layers.Flatten()(conv2)
+        conv3 = layers.Flatten()(conv3)
+
+        # Concatenate all outputs
+        concat = layers.Concatenate()([conv1, conv2, conv3, transformer])
+
+        # Final Dense layers
+        x = layers.Dense(256, activation='relu')(concat)
+        x = layers.Dropout(drop_rate)(x)
+        x = layers.Dense(128, activation='relu')(x)
+        x = layers.Dropout(drop_rate)(x)
+        outputs = layers.Dense(num_classes, activation='sigmoid' if num_classes == 1 else 'softmax')(x)
+
+        model = keras.Model(inputs, outputs)
+        return model
+
+    def train_deep_model(self, model, X_train, y_train, optimizer, loss_function, callbacks, metrics, class_weight, epochs=30):
+        model.compile(optimizer=optimizer, loss=loss_function, metrics=metrics)
+        history = model.fit(X_train, y_train, epochs=epochs, batch_size=128,
+                            validation_split=0.2, callbacks=callbacks,
+                            class_weight=class_weight, verbose=1)
+        return history
+
+    def evaluate(self, model, X_test, y_test, batch_size=128, threshold=0.9, title='Model', model_name='Model', plot=False):
+        y_pred = model.predict(X_test, batch_size=batch_size)
+        y_pred_binary = (y_pred > threshold).astype(int)
+        acc = tf.keras.metrics.BinaryAccuracy()(y_test, y_pred_binary)
+        print(f'{title} Accuracy: {acc.numpy():.4f}')
+        return y_pred_binary
+
+    def plot_learning_curves(self, history):
+        import matplotlib.pyplot as plt
+        plt.plot(history.history['accuracy'], label='train_accuracy')
+        plt.plot(history.history['val_accuracy'], label='val_accuracy')
+        plt.title('Model Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.show()
+
+# === Execution ===
+
+train_evaluate_deep = TrainEvaluateDeep()
+
+print('1. Build Model...')
+pcnn_model = train_evaluate_deep.build_pcnn_transformer(input_size=X_train.shape[1:])
+
+print('2. Train Model...')
+
+def get_early_stopping(metric='val_accuracy', patience=10, mode='max'):
+    return EarlyStopping(monitor=metric, patience=patience, mode=mode, restore_best_weights=True)
+
+classification_metrics = ['accuracy']
+
+pcnn_history = train_evaluate_deep.train_deep_model(pcnn_model,
+                                                    X_train,
+                                                    y_train,
+                                                    optimizer=tf.optimizers.Adam(learning_rate=0.001),
+                                                    loss_function=keras.losses.BinaryCrossentropy(),
+                                                    callbacks=[get_early_stopping()],
+                                                    metrics=classification_metrics,
+                                                    class_weight=class_weight,
+                                                    epochs=30)
+
+print('3. Evaluation...')
+prediction = train_evaluate_deep.evaluate(pcnn_model, X_test, y_test, batch_size=128, threshold=0.9, title='PCNN-Transformer', model_name='PCNN-Transformer', plot=False)
+
+plot_learning_curves = False
+if plot_learning_curves:
+    print('4. Plot learning curves...')
+    _ = train_evaluate_deep.plot_learning_curves(pcnn_history)
+
+
+
+
+
+
+
+
+
+
+
+
+## Traditional Models
+
+class Traditional_Models():
+
+  def __init__(self,
+               models,
+               model_parameters,
+               predictions={},
+               results={}):
+    self.models = models
+    self.model_parameters = model_parameters
+    self.predictions = predictions
+    self.results = results
+
+  def __validation(self, X_train, y_train, validation_size=0.35):
+    _, X_validation, _, y_validation = train_test_split(X_train, y_train, test_size=validation_size, stratify=y_train)
+    return X_validation, y_validation
+
+  def __flatten(self, feature_3d):
+    return feature_3d.reshape(feature_3d.shape[0], feature_3d.shape[1]*feature_3d.shape[-1])
+
+  def __feature_selector(self, X_train, y_train, X_test, class_weight, d=64):
+    feature_selector = DecisionTreeClassifier(class_weight=class_weight).fit(X_train, y_train)
+    important_features = np.argpartition(feature_selector.feature_importances_, -d)[-d:]
+    return X_train[:,important_features], X_test[:,important_features]
+
+  def __parameter_tuning(self, model, parameters, X_validation, y_validation, scoring='f1_macro'):
+    optimizer = GridSearchCV(estimator=model, param_grid=parameters, scoring=scoring)
+    optimizer.fit(X_validation, y_validation)
+    return model.set_params(**optimizer.best_params_)
+
+  def __train_model(self, model, X_train, y_train):
+    return model.fit(X_train, y_train)
+
+  def __evaluate(self, model, X_test, y_test, title=''):
+    prediction = model.predict(X_test)
+    self.results[title] = classification_report(y_test, prediction, output_dict=True)
+    print()
+    plot_confusion_matrix(confusion_matrix(y_test, prediction), title=title)
+    print()
+    return prediction
+
+  def pipeline(self,
+               X_train,
+               y_train,
+               X_test,
+               y_test,
+               class_weight,
+               validation_size=35,
+               number_features=64,
+               tuning_metric='f1_macro'):
+    print('1) Reducing dimension of feature matrices...')
+    X_train_flattened, X_test_flattened = self.__flatten(X_train), self.__flatten(X_test)
+    print('2) Feature selection...')
+    X_train_flattened, X_test_flattened = self.__feature_selector(X_train_flattened, y_train, X_test_flattened, class_weight=class_weight, d=number_features)
+    print('3) Generating validation matrices for hyper-parameter tuning...')
+    X_validation, y_validation = self.__validation(X_train_flattened, y_train, validation_size=validation_size)
+    print('4) Train & Evaluation...')
+    for model_name, model in self.models.items():
+      print()
+      print(f'----------------- Working on {model_name} -----------------')
+      print()
+      if model_name in self.model_parameters:
+        model = self.__parameter_tuning(model, self.model_parameters[model_name], X_validation, y_validation, scoring=tuning_metric)
+      mdoel =  self.__train_model(model, X_train_flattened, y_train)
+      self.predictions[model_name] = self.__evaluate(model, X_test_flattened, y_test, title=model_name)
+    return self.predictions, self.results
+
+model_parameters = {'KNN':{'n_neighbors':[2,4,8,16], 'metric':['euclidean','cosine']},
+                    'Random Forest':{'criterion':['gini', 'entropy', 'log_loss']},
+                    'Decision Tree':{'criterion':['gini', 'entropy', 'log_loss']},
+                    }
+
+
+tradional_models = Traditional_Models(models = {'Logistic Regression':LogisticRegression(class_weight=class_weight),
+                                                'Random Forest':RandomForestClassifier(class_weight=class_weight),
+                                                'KNN':KNeighborsClassifier(),
+                                                'Decision Tree': DecisionTreeClassifier(class_weight=class_weight)},
+                                      model_parameters = model_parameters)
+
+predictions, results = tradional_models.pipeline(X_train,
+                                                 y_train,
+                                                 X_test,
+                                                 y_test,
+                                                 class_weight)
+
+save_pickle(predictions, '/content/gdrive/MyDrive/Fall Detection System/Results/predictions.pkl')
+save_pickle(results, '/content/gdrive/MyDrive/Fall Detection System/Results/results.pkl')
+
+## Deep Models
+
+classification_metrics = [keras.metrics.TruePositives(name='TP'),
+                          keras.metrics.FalsePositives(name='FP'),
+                          keras.metrics.TrueNegatives(name='TN'),
+                          keras.metrics.FalseNegatives(name='FN'),
+                          keras.metrics.BinaryAccuracy(name='Accuracy'),
+                          keras.metrics.Precision(name='Precision'),
+                          keras.metrics.Recall(name='Recall'),
+                          keras.metrics.AUC(name='AUC'),
+                          keras.metrics.AUC(name='PRC', curve='PR')]
+
+def get_early_stopping(metric='val_PRC', patience=5, mode='max'):
+  early_stopping = keras.callbacks.EarlyStopping(monitor=metric,
+                                                verbose=1,
+                                                patience=patience,
+                                                mode=mode,
+                                                restore_best_weights=True)
+  return early_stopping
+
+class Train_Evaluate_Deep():
+
+  def __init__(self,
+               predictions={},
+               results={}):
+
+      self.predictions = predictions
+      self.results = results
+
+  def build_cnn(self, input_size, units=128, drop_rate=0.25, filter=32, kernel_size=(1*9), output_size=1):
+    input = keras.layers.Input((input_size))
+    x = keras.layers.Conv1D(filters=filter//2, kernel_size=kernel_size, padding='same', activation='relu', name="conv1")(input)
+    x = keras.layers.Conv1D(filters=filter, kernel_size=kernel_size, padding='same', activation='relu', name="conv2")(x)
+    x = keras.layers.Conv1D(filters=filter*2, kernel_size=kernel_size, padding='same', activation='relu', name="conv3")(x)
+    x = tf.keras.layers.Flatten()(x)
+    classifier = keras.layers.Dense(units*4, activation='relu')(x)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    classifier = keras.layers.Dense(units, activation='relu')(classifier)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    classifier = keras.layers.Dense(units//2, activation='relu')(classifier)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    output = keras.layers.Dense(output_size, activation='sigmoid')(classifier)
+    model = keras.Model(inputs=input, outputs=output)
+    return model
+
+  def build_lstm(self, input_size, units=128, drop_rate=0.25, lstm_units=16, output_size=1):
+    input = keras.layers.Input((input_size))
+    x = keras.layers.LSTM(units=lstm_units//2, input_shape=input_size, return_sequences=True, name="lstm1")(input)
+    x = keras.layers.LSTM(units=lstm_units, input_shape=input_size, return_sequences=True, name="lstm2")(x)
+    x = keras.layers.LSTM(units=lstm_units*2, input_shape=input_size, return_sequences=True, name="lstm3")(x)
+    x = tf.keras.layers.Flatten()(x)
+    classifier = keras.layers.Dense(units*4, activation='relu')(x)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    classifier = keras.layers.Dense(units, activation='relu')(classifier)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    classifier = keras.layers.Dense(units//2, activation='relu')(classifier)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    output = keras.layers.Dense(output_size, activation='sigmoid')(classifier)
+    model = keras.Model(inputs=input, outputs=output)
+    return model
+
+  def build_mlp(self, input_size, hidden_layer_size=128, output_size=1, drop_rate=0.25):
+    input = keras.layers.Input((input_size))
+    x = keras.layers.Dense(hidden_layer_size//4, activation='relu')(input)
+    x = keras.layers.Dense(hidden_layer_size//2, activation='relu')(x)
+    x = keras.layers.Dense(hidden_layer_size, activation='relu')(x)
+    x = tf.keras.layers.Flatten()(x)
+    classifier = keras.layers.Dense(hidden_layer_size*4, activation='relu')(x)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    classifier = keras.layers.Dense(hidden_layer_size, activation='relu')(classifier)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    classifier = keras.layers.Dense(hidden_layer_size//2, activation='relu')(classifier)
+    classifier = keras.layers.Dropout(drop_rate)(classifier)
+    output = keras.layers.Dense(output_size, activation='sigmoid')(classifier)
+    model = keras.Model(inputs=input, outputs=output)
+    return model
+
+  def build_AE(self, input_size, latent_dim=128, filter=64, kernel_size=(1*9)):
+    input = keras.layers.Input((input_size))
+    encoder = keras.layers.Conv1D(filters=filter//2, kernel_size=kernel_size, padding='same', activation='relu', name="conv1")(input)
+    encoder = keras.layers.Conv1D(filters=filter, kernel_size=kernel_size, padding='same', activation='relu', name="conv2")(encoder)
+    encoder = tf.keras.layers.Flatten()(encoder)
+    encoder = keras.layers.Dense(latent_dim*4, activation='relu')(encoder)
+    encoder = keras.layers.Dense(latent_dim*2, activation='relu')(encoder)
+
+    latent = keras.layers.Dense(latent_dim, activation='relu')(encoder)
+
+    decoder = keras.layers.Dense(latent_dim*2, activation='relu')(latent)
+    decoder = keras.layers.Dense(latent_dim*4, activation='relu')(decoder)
+    decoder = keras.layers.Dense(filter*input_size[0], activation='relu')(decoder)
+    decoder = keras.layers.Reshape((input_size[0], filter))(decoder)
+    decoder = keras.layers.Conv1DTranspose(filters=filter, kernel_size=kernel_size, padding='same', activation='relu')(decoder)
+    decoder = keras.layers.Conv1DTranspose(filters=filter//2, kernel_size=kernel_size, padding='same', activation='relu')(decoder)
+
+    output = keras.layers.Conv1DTranspose(filters=input_size[-1], kernel_size=kernel_size, padding='same', activation='relu')(decoder)
+    model = keras.Model(inputs=input, outputs=output)
+    return model
+
+  def train_deep_model(self,
+                       model,
+                       X_train,
+                       y_train,
+                       metrics,
+                       loss_function,
+                       optimizer,
+                       callbacks,
+                       class_weight=None,
+                       epochs=100,
+                       batch_size=128,
+                       validation_split=0.2):
+
+    print('----------------------------------')
+    print(model.summary())
+    print('----------------------------------')
+
+    model.compile(optimizer=optimizer,
+                  loss=loss_function,
+                  metrics=metrics)
+
+    if not class_weight is None:
+      history = model.fit(X_train,
+                          y_train,
+                          batch_size = batch_size,
+                          epochs = epochs,
+                          shuffle = True,
+                          class_weight = class_weight,
+                          validation_split = validation_split,
+                          callbacks = callbacks,
+                          verbose = 1)
+    else:
+      history = model.fit(X_train,
+                          y_train,
+                          batch_size = batch_size,
+                          epochs = epochs,
+                          shuffle = True,
+                          validation_split = validation_split,
+                          callbacks = callbacks,
+                          verbose = 1)
+    return history
+
+  def evaluate(self, model, X_test, y_test, batch_size=128, threshold=0.5, title='', model_name='', plot=True):
+    prediction = model.predict(X_test, batch_size=batch_size)
+    self.predictions[model_name] = prediction
+    prediction = np.where(prediction >= threshold, 1, 0)
+    if plot:
+      print()
+      print('1) Plot ROC Curve...')
+      print()
+      plot_roc_curve(y_test, prediction, title='ROC Curve of {model_name} Model'.format(model_name=model_name), model_name=model_name, file_name=None)
+      print()
+      print('2) Plot AUC Curve...')
+      print()
+      plot_auc_curve(y_test, prediction, title='AUC Curve of {model_name} Model'.format(model_name=model_name), model_name=model_name, file_name = None)
+      print()
+      print('3) Plot Percision_Recall Curve......')
+      print()
+      plot_precision_recall_curve(y_test, prediction, title='Percision_Recall Curve of {model_name} Model'.format(model_name=model_name), model_name=model_name, file_name=None)
+    report = classification_report(y_test, prediction, output_dict=True)
+    self.results[model_name] = report
+    print()
+    plot_confusion_matrix(confusion_matrix(y_test, prediction), title=title)
+    print()
+    return prediction
+
+  def plot_learning_curves(self, history):
+    print('1) Plot learning process based on different metrics...')
+    print()
+    plot_metrics(history)
+    print()
+    print('2) Plot learning curve...')
+    print()
+    return plot_history(history)
+
+predictions = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Results/predictions.pkl')
+results = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Results/results.pkl')
+
+train_evaluate_deep = Train_Evaluate_Deep(predictions=predictions,
+                                          results=results)
+
+print('1. Build Model...')
+cnn_model = train_evaluate_deep.build_cnn(input_size=X_train.shape[1:])
+print('2. Train Model...')
+cnn_history = train_evaluate_deep.train_deep_model(cnn_model,
+                                                   X_train,
+                                                   y_train,
+                                                   optimizer=tf.optimizers.SGD(learning_rate=0.001),
+                                                   loss_function=keras.losses.BinaryCrossentropy(),
+                                                   callbacks=[get_early_stopping(metric='val_PRC', patience=10, mode='max')],
+                                                   metrics=classification_metrics,
+                                                   class_weight=class_weight,
+                                                   epochs=30)
+print('3. Evaluation...')
+prediction = train_evaluate_deep.evaluate(cnn_model, X_test, y_test, batch_size=128, threshold=0.9, title='CNN + MLP', model_name='CNN + MLP', plot=False)
+
+plot_learning_curves=False
+if plot_learning_curves:
+  print('4. Plot learning curves...')
+  _ = train_evaluate_deep.plot_learning_curves(cnn_history)
+
+print('1. Build Model...')
+LSTM_model = train_evaluate_deep.build_lstm(input_size=X_train.shape[1:])
+print('2. Train Model...')
+LSTM_history = train_evaluate_deep.train_deep_model(LSTM_model,
+                                                   X_train,
+                                                   y_train,
+                                                   optimizer=tf.optimizers.SGD(learning_rate=0.001),
+                                                   loss_function=keras.losses.BinaryCrossentropy(),
+                                                   callbacks=[get_early_stopping(metric='val_PRC', patience=10, mode='max')],
+                                                   metrics=classification_metrics,
+                                                   class_weight=class_weight,
+                                                   epochs=30)
+
+print('3. Evaluation...')
+prediction = train_evaluate_deep.evaluate(LSTM_model, X_test, y_test, batch_size=128, threshold=0.9, title='LSTM + MLP', model_name='LSTM + MLP', plot=False)
+
+plot_learning_curves=False
+if plot_learning_curves:
+  print('4. Plot learning curves...')
+  _ = train_evaluate_deep.plot_learning_curves(LSTM_history)
+
+print('1. Build Model...')
+mlp_model = train_evaluate_deep.build_mlp(input_size=X_train.shape[1:], hidden_layer_size=128, output_size=1)
+print('2. Train Model...')
+mlp_history = train_evaluate_deep.train_deep_model(mlp_model,
+                                                   X_train,
+                                                   y_train,
+                                                   optimizer=tf.optimizers.SGD(learning_rate=0.001),
+                                                   loss_function=keras.losses.BinaryCrossentropy(),
+                                                   callbacks=[get_early_stopping(metric='val_PRC', patience=10, mode='max')],
+                                                   metrics=classification_metrics,
+                                                   class_weight=class_weight,
+                                                   epochs=30)
+
+print('3. Evaluation...')
+prediction = train_evaluate_deep.evaluate(mlp_model, X_test, y_test, batch_size=128, threshold=0.9, title='MLP', model_name='MLP', plot=False)
+
+plot_learning_curves=False
+if plot_learning_curves:
+  print('4. Plot learning curves...')
+  _ = train_evaluate_deep.plot_learning_curves(mlp_history)
+
+## Conclusions
+
+predictions = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Results/predictions.pkl')
+results = load_pickle('/content/gdrive/MyDrive/Fall Detection System/Results/results.pkl')
+
+import pandas as pd
+
+def convert_report_df(report):
+  d = {}
+  for key, value in report.items():
+      temp = {}
+      for label, metrics in value.items():
+        if type(metrics)==dict:
+          for metric, score in metrics.items():
+            temp[metric+'_'+label] = score
+        else:
+          temp[label] = metrics
+      d[key] = temp
+  return pd.DataFrame.from_dict(d).T.style.background_gradient(cmap="PuBu")
+
+convert_report_df(results)

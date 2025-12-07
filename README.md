@@ -41,6 +41,15 @@ It is designed for **wearable sensor-based fall detection** using the SisFall da
 
 ---
 
-## ataset
+## Dataset
 - SisFall Dataset (used for fall detection from wearable sensors)
+
+---
+## Output
+- Trained ML & DL models
+- Classification reports
+- Confusion matrices
+- ROC & AUC plots
+- Learning curves
+- Saved prediction results using Pickle
 
